@@ -61,33 +61,6 @@ module cache #(
     localparam WAY_BITS = $clog2((NUM_WAYS > 1) ? NUM_WAYS : 2);
     localparam [31:0] BLOCK_BYTES = BLOCK_SIZE;
 
-    // BASE-CACHE INTEGRATION BOUNDARY
-    // The starting cache.v has no tag/data arrays or demand/write controller.
-    // Replace these tie-offs with that implementation's signals. They keep
-    // the feature logic inert until connected, rather than inventing hits.
-    // See documentation/plru_prefetch.md for the timing contract.
-    wire base_load_miss = 1'b0;
-    wire [31:0] base_miss_addr = 32'b0;
-    wire base_ready = 1'b0;
-    wire [31:0] base_rdata = 32'b0;
-    wire base_mem_wr = 1'b0;
-    wire [31:0] base_mem_wr_addr = 32'b0;
-    wire [BLOCK_SIZE*8-1:0] base_mem_wr_data = {BLOCK_SIZE*8{1'b0}};
-    wire [BLOCK_SIZE-1:0] base_mem_wr_be = {BLOCK_SIZE{1'b0}};
-    wire [NUM_SETS*NUM_WAYS-1:0] base_valid = {NUM_SETS*NUM_WAYS{1'b0}};
-    wire base_touch = 1'b0;
-    wire [SET_BITS-1:0] base_touch_set = {SET_BITS{1'b0}};
-    wire [WAY_BITS-1:0] base_touch_way = {WAY_BITS{1'b0}};
-    wire [SET_BITS-1:0] base_replacement_set = {SET_BITS{1'b0}};
-    wire [WAY_BITS-1:0] base_lru_victim_way = {WAY_BITS{1'b0}};
-    // Tag lookup results for prefetch_lookup_addr and prefetch_fill_addr.
-    wire base_prefetch_cached = 1'b0;
-    wire base_prefetch_fill_cached = 1'b0;
-    // Old contents of (prefetch_fill_set, replacement_way), before filling.
-    wire base_prefetch_victim_dirty = 1'b0;
-    wire [31:0] base_prefetch_victim_addr = 32'b0;
-    wire [BLOCK_SIZE*8-1:0] base_prefetch_victim_data = {BLOCK_SIZE*8{1'b0}};
-
     // Four in-flight records track the in-order memory replies. A demand
     // reserves another slot for its next-line request, so that prefetch can
     // always issue in the following cycle, even at arbitrary memory latency.
@@ -102,7 +75,7 @@ module cache #(
     reg prefetch_pending;
     reg [31:0] pending_addr;
 
-    wire [31:0] demand_line_addr = {base_miss_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+    wire [31:0] demand_line_addr = {i_addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
     wire [31:0] next_line_addr = demand_line_addr + BLOCK_BYTES;
     wire [31:0] prefetch_lookup_addr = prefetch_pending ? pending_addr : next_line_addr;
     wire [REQUEST_DEPTH:0] demand_duplicate;
@@ -112,47 +85,29 @@ module cache #(
 
     wire request_pop = ~i_rst & i_mem_valid & (request_count != 0);
     wire demand_return = request_pop & ~request_prefetch[request_head];
-    wire [31:0] demand_return_addr = request_addr[request_head];
-    wire [BLOCK_SIZE*8-1:0] demand_return_data = i_mem_rd_data;
     wire prefetch_return = request_pop & request_prefetch[request_head];
-    wire [31:0] prefetch_fill_addr = request_addr[request_head];
-    wire [BLOCK_SIZE*8-1:0] prefetch_fill_data = i_mem_rd_data;
-    wire prefetch_fill = prefetch_return & ~base_prefetch_fill_cached;
-    wire [SET_BITS-1:0] cpu_set;
-    wire [SET_BITS-1:0] prefetch_fill_set;
-    generate
-        if (NUM_SETS == 1) begin : single_set
-            assign cpu_set = {SET_BITS{1'b0}};
-            assign prefetch_fill_set = {SET_BITS{1'b0}};
-        end else begin : multiple_sets
-            assign cpu_set = i_addr[OFFSET_BITS +: SET_BITS];
-            assign prefetch_fill_set = prefetch_fill_addr[OFFSET_BITS +: SET_BITS];
-        end
-    endgenerate
+    wire [NUM_WAYS-1:0] prefetch_cached_vec;
+    wire [NUM_WAYS-1:0] fill_cached_vec;
+    wire prefetch_cached = |prefetch_cached_vec;
+    wire fill_cached = |fill_cached_vec;
+    wire prefetch_fill = prefetch_return & ~fill_cached;
+    wire load_miss;
 
-    // Collision option B: install the prefetch first, then retry the CPU
-    // access next cycle. Also serialize stores against a dirty write-back,
-    // since there is only one memory write port, even for different sets.
-    wire prefetch_cpu_stall = prefetch_fill & (i_ren | i_wen) &
-                             ((cpu_set == prefetch_fill_set) |
-                              (i_wen & base_prefetch_victim_dirty));
-    wire prefetch_writeback = prefetch_fill & base_prefetch_victim_dirty;
-    assign o_ready = base_ready & ~prefetch_cpu_stall & ~i_rst;
-    assign o_rdata = base_rdata;
-    assign o_mem_wr = ~i_rst & (prefetch_writeback | (base_mem_wr & ~prefetch_cpu_stall));
-    assign o_mem_wr_addr = prefetch_writeback ? base_prefetch_victim_addr : base_mem_wr_addr;
-    assign o_mem_wr_data = prefetch_writeback ? base_prefetch_victim_data : base_mem_wr_data;
-    assign o_mem_wr_be = prefetch_writeback ? {BLOCK_SIZE{1'b1}} : base_mem_wr_be;
+    // A store must not pass a read of its line: memory can sample the old
+    // contents at request time. Wait for the prefetch to install, then retry
+    // the store as a hit. Include a next-line read scheduled for this cycle.
+    wire store_inflight = i_wen & (demand_duplicate[REQUEST_DEPTH] |
+                          (prefetch_pending & (pending_addr == demand_line_addr)));
 
     // A pending prefetch has priority over the next demand. Tag lookup is
     // repeated at issue, and outstanding lines are not requested twice.
-    wire prefetch_send = ~i_rst & prefetch_pending & ~base_prefetch_cached &
+    wire prefetch_send = ~i_rst & prefetch_pending & ~prefetch_cached &
                          ~prefetch_duplicate[REQUEST_DEPTH];
     wire demand_room = (PREFETCH_EN == 0) ?
                        ((request_count < REQUEST_LIMIT) | request_pop) :
                        ((request_count < DEMAND_LIMIT) |
                         ((request_count == DEMAND_LIMIT) & request_pop));
-    wire demand_accept = ~i_rst & base_load_miss & ~prefetch_cpu_stall &
+    wire demand_accept = ~i_rst & load_miss &
                          ~prefetch_send & demand_room & ~demand_duplicate[REQUEST_DEPTH];
     assign o_mem_rd = prefetch_send | demand_accept;
     assign o_mem_rd_addr = prefetch_send ? pending_addr : demand_line_addr;
@@ -211,43 +166,12 @@ module cache #(
         end
     endgenerate
 
-    // Select a victim at fill time, including for a returning prefetch.
-    // The base controller uses replacement_way for a demand fill as well.
-    wire [SET_BITS-1:0] replacement_set = prefetch_fill ? prefetch_fill_set : base_replacement_set;
-    wire [WAY_BITS-1:0] replacement_way;
-    wire [WAY_BITS-1:0] plru_victim [0:NUM_SETS-1];
-    genvar set_index;
-    generate
-        if (EVICT_POLICY == 1) begin : use_plru
-            for (set_index = 0; set_index < NUM_SETS; set_index = set_index + 1) begin : sets
-                localparam [SET_BITS-1:0] SET = set_index;
-                wire fill_this_set = prefetch_fill & (prefetch_fill_set == SET);
-                wire touch_this_set = base_touch & ~prefetch_cpu_stall & (base_touch_set == SET);
-                plru #(.NUM_WAYS(NUM_WAYS)) replacement (
-                    .i_clk(i_clk),
-                    .i_rst(i_rst),
-                    .i_valid(base_valid[set_index*NUM_WAYS +: NUM_WAYS]),
-                    .i_touch(fill_this_set | touch_this_set),
-                    .i_touch_way(fill_this_set ? replacement_way : base_touch_way),
-                    .o_victim_way(plru_victim[set_index])
-                );
-            end
-            assign replacement_way = plru_victim[replacement_set];
-        end else begin : use_base_lru
-            assign replacement_way = base_lru_victim_way;
-        end
-    endgenerate
-
-
   localparam LINE_BITS   = BLOCK_SIZE * 8;
   localparam WORDS       = BLOCK_SIZE / 4; // words per line
   localparam NUM_LINES   = (CACHE_SIZE * 1024) / BLOCK_SIZE;
-  localparam NUM_SETS    = NUM_LINES / NUM_WAYS; // power of 2
-  localparam OFFSET_BITS = $clog2(BLOCK_SIZE); // byte in line
   localparam WORD_BITS   = OFFSET_BITS - 2; // word in line
   localparam INDEX_BITS  = $clog2(NUM_SETS); // 0 if fully assoc.
   localparam TAG_BITS    = 32 - OFFSET_BITS - INDEX_BITS;
-  localparam WAY_BITS    = $clog2(NUM_WAYS);  // 0 if direct mapped
 
   //widths that cannot be zero.
   localparam IDX_W = (INDEX_BITS > 0) ? INDEX_BITS : 1;
@@ -268,31 +192,26 @@ module cache #(
 
   //controller state
   reg         state;
-  reg  [31:0] miss_addr;      // line address of the outstanding demand read
  
-  //Fill: a line arriving from main memory this cycle.
-    //fill - i_mem_valid is high and a read is outstanding
-    //fill_is_demand - the CPU is stalled and waiting on this line
-    //fill_addr - this is the line address of the read being answered
-    //without the prefetch, the only outstanding read is the demand miss,
-    //so every fill is a demand fill and its address is the miss_addr.
-
-    //prefetch hook: memory answers in order, so keep a queue of outstanding
-    //reads. then fill is any arriving line, fill_addr is the address at the head of
-    //the queue, and fill_is_demand is the entry's demand flag.
-  wire  fill = (state == S_WAIT) & i_mem_valid;
-  wire fill_is_demand = 1'b1;
-  wire [31:0] fill_addr = miss_addr;
+  // The queue owns every response, even after the demand has completed.
+  // Discard an already-cached prefetch instead of overwriting newer stores.
+  wire fill = demand_return | prefetch_fill;
+  wire fill_is_demand = demand_return;
+  wire [31:0] fill_addr = request_addr[request_head];
   wire [TAG_BITS-1:0] fill_tag = fill_addr[31 -: TAG_BITS];
   wire [IDX_W-1:0] fill_set;
+  wire [IDX_W-1:0] prefetch_lookup_set;
+  wire [TAG_BITS-1:0] prefetch_lookup_tag = prefetch_lookup_addr[31 -: TAG_BITS];
 
   generate
     if (INDEX_BITS > 0) begin : g_index
       assign cpu_set  = i_addr[OFFSET_BITS +: INDEX_BITS];
       assign fill_set = fill_addr[OFFSET_BITS +: INDEX_BITS];
+      assign prefetch_lookup_set = prefetch_lookup_addr[OFFSET_BITS +: INDEX_BITS];
     end else begin : g_no_index
       assign cpu_set  = 1'b0;
       assign fill_set = 1'b0;
+      assign prefetch_lookup_set = 1'b0;
     end
     if (WORD_BITS > 0) begin : g_word
       assign cpu_word = i_addr[2 +: WORD_BITS];
@@ -301,11 +220,11 @@ module cache #(
     end
   endgenerate
 
-  //a fill has priority over the CPU for the arrays. With no prefetch a fill
-  // only happens when the CPU is waiting so this will never cost a cycle.
+  // Collision option B: a fill owns the shared array/replacement port for
+  // this cycle. Retry CPU accesses next cycle, including stores to a victim.
 
   wire idle   = (state == S_IDLE);
-  wire cpu_go = idle & ~fill;
+  wire cpu_go = idle & ~fill & ~store_inflight & ~i_rst;
 
   // The set whose replacement state and victim are used this cycle: the fill
   // set while a line is arriving, otherwise the CPU's set.
@@ -344,7 +263,7 @@ module cache #(
  
   // CPU access outcomes (only while idle and no fill is using the arrays).
   wire load_hit   = cpu_go & i_ren & hit;
-  wire load_miss  = cpu_go & i_ren & ~hit;
+  assign load_miss = cpu_go & i_ren & ~hit;
   wire store_hit  = cpu_go & i_wen & hit;
   wire store_miss = cpu_go & i_wen & ~hit;
  
@@ -364,6 +283,9 @@ module cache #(
       assign hit_vec[w] = valid[cpu_set] & (tags[cpu_set] == cpu_tag);
       assign hit_way_c[w+1]  = hit_way_c[w]  | (hit_vec[w] ? ID : {WAY_W{1'b0}});
       assign hit_line_c[w+1] = hit_line_c[w] | (hit_vec[w] ? data[cpu_set] : {LINE_BITS{1'b0}});
+      assign prefetch_cached_vec[w] = valid[prefetch_lookup_set] &
+                                      (tags[prefetch_lookup_set] == prefetch_lookup_tag);
+      assign fill_cached_vec[w] = valid[fill_set] & (tags[fill_set] == fill_tag);
  
       // Replacement / victim port.
       wire is_victim = (victim == ID);
@@ -419,7 +341,8 @@ module cache #(
   genvar k;
   generate
     for (k = 0; k < WORDS; k = k + 1) begin : g_word_k
-      wire sel = (cpu_word == k);
+      localparam [WRD_W-1:0] WORD_ID = k;
+      wire sel = (cpu_word == WORD_ID);
       assign store_line[32*k +: 32] = sel ? merged_word : hit_line[32*k +: 32];
       assign wt_be[4*k +: 4]        = sel ? i_mask : 4'b0000;
     end
@@ -534,12 +457,10 @@ module cache #(
     if (i_rst) 
     begin
       state     <= S_IDLE;
-      miss_addr <= 32'd0;
     end 
-    else if (load_miss) 
+    else if (demand_accept)
     begin
       state     <= S_WAIT;
-      miss_addr <= cpu_line_addr;
     end 
     else if (fill && fill_is_demand)
     begin
@@ -549,13 +470,11 @@ module cache #(
 
 wire demand_done = fill & fill_is_demand;
 
-assign o_ready = ~(i_ren | i_wen) | load_hit | store_hit | store_miss | demand_done;
+assign o_ready = ~i_rst & (~(i_ren | i_wen) | load_hit | store_hit | store_miss | demand_done);
 assign o_rdata = demand_done ? fill_word : hit_word;
 
   //memory port
-  // Read: one-cycle request for the missing line, sent in the miss cycle.
-  assign o_mem_rd      = load_miss;
-  assign o_mem_rd_addr = cpu_line_addr;
+  // Reads are issued and tracked by the demand/prefetch queue above.
  
   // Write: either the dirty victim of a fill (whole line), or a store miss
   // written through without allocating (only the stored bytes). They never
