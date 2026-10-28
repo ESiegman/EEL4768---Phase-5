@@ -33,7 +33,8 @@ fi
 module_sources() {
     case "$1" in
         decoder) echo "decoder.v imm.v" ;;
-        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v" ;;
+        cache)   echo "cache.v plru.v" ;;
+        hart)    echo "hart.v alu.v rf.v decoder.v imm.v cache.v plru.v" ;;
         *)       echo "$1.v" ;;
     esac
 }
