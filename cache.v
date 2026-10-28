@@ -77,8 +77,6 @@ module cache #(
   localparam S_IDLE = 1'b0;   // ready for a CPU access
   localparam S_WAIT = 1'b1;   // load miss outstanding, waiting on i_mem_valid
 
-  localparam S_IDLE = 1'b0;   // ready for a CPU access
-  localparam S_WAIT = 1'b1;   // load miss outstanding, waiting on i_mem_valid
 
 
   //address split: | tag | set index | word | byte | 
@@ -92,15 +90,15 @@ module cache #(
   reg  [31:0] miss_addr;      // line address of the outstanding demand read
  
   //Fill: a line arriving from main memory this cycle.
-    //fill - i_mem_valid is high and a read is oustanding
+    //fill - i_mem_valid is high and a read is outstanding
     //fill_is_demand - the CPU is stalled and waiting on this line
     //fill_addr - this is the line address of the read being answered
     //without the prefetch, the only outstanding read is the demand miss,
     //so every fill is a demand fill and its address is the miss_addr.
 
-    //prefetch hook: memory answers in order, so keep a queue of oustanding
+    //prefetch hook: memory answers in order, so keep a queue of outstanding
     //reads. then fill is any arriving line, fill_addr is the address at the head of
-    //the queue, and fill_is_demand is the entry's demand flag,.
+    //the queue, and fill_is_demand is the entry's demand flag.
   wire  fill = (state == S_WAIT) & i_mem_valid;
   wire fill_is_demand = 1'b1;
   wire [31:0] fill_addr = miss_addr;
@@ -212,7 +210,7 @@ module cache #(
     end
   endgenerate
 
-    //word select and store merge. word k of a kline is bits [32k +: 32];
+    //word select and store merge. word k of a line is bits [32k +: 32];
     //the variable select uses a concatenation instead of multiply.
   wire [31:0] hit_word;
   wire [31:0] fill_word;
@@ -247,7 +245,7 @@ module cache #(
   endgenerate
 
     
-  //replacement. when a hit or a fill makes its way. on a fill the victim
+  //replacement. a hit or a fill touches its way. on a fill the victim
   //is the lowest-numbered invalid way, otherwise the policy's choice
   wire             touch_en  = fill | load_hit | store_hit;
   wire [WAY_W-1:0] touch_way = fill ? victim : hit_way;
@@ -263,8 +261,8 @@ module cache #(
         //   *i_set    [IDX_W-1:0]  set being accessed. read the tree for this set and
         //                                 if i_touch is high, update it.
         
-        //  *i_touch               High on a hit or a fill. at the clock edge, set ewvery node on
-        //                         i_way's path to poing away from i_way
+        //  *i_touch               High on a hit or a fill. at the clock edge, set every node on
+        //                         i_way's path to point away from i_way
         
         //  *i_way    [WAY_W-1:0]  the way that was hit or filled.
 
@@ -272,9 +270,10 @@ module cache #(
       //Output:  
         //  *o_victim [WAY_W-1:0]  way the tree for i_set currently points to, using the 
         //                         bits from before the cycle's update (combinational)
-        //                         Must always be less than NUM_WAYS, even 
+        //                         Must always be less than NUM_WAYS, even when
+        //                         NUM_WAYS isn't a power of 2.
         
-      // Beacuse cache.v already picks the lowest invalid way first plru.v only has to track the tree itself.
+      // Because cache.v already picks the lowest invalid way first plru.v only has to track the tree itself.
       plru #(
           .NUM_WAYS(NUM_WAYS),
           .NUM_SETS(NUM_SETS)
@@ -374,7 +373,6 @@ module cache #(
       state     <= S_IDLE;
     end
   end
-endmodule
 
 wire demand_done = fill & fill_is_demand;
 
