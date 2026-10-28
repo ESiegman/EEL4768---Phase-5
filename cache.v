@@ -257,34 +257,26 @@ module cache #(
       assign policy_way = 1'b0;
     end else if (EVICT_POLICY == 1) begin : g_plru
         
-      //Inputs ( all describe the same set, in the same cycle):
-        //   *i_set    [IDX_W-1:0]  set being accessed. read the tree for this set and
-        //                                 if i_touch is high, update it.
-        
-        //  *i_touch               High on a hit or a fill. at the clock edge, set every node on
-        //                         i_way's path to point away from i_way
-        
-        //  *i_way    [WAY_W-1:0]  the way that was hit or filled.
-
-
-      //Output:  
-        //  *o_victim [WAY_W-1:0]  way the tree for i_set currently points to, using the 
-        //                         bits from before the cycle's update (combinational)
-        //                         Must always be less than NUM_WAYS, even when
-        //                         NUM_WAYS isn't a power of 2.
-        
-      // Because cache.v already picks the lowest invalid way first plru.v only has to track the tree itself.
-      plru #(
-          .NUM_WAYS(NUM_WAYS),
-          .NUM_SETS(NUM_SETS)
-      ) u_plru (
-          .i_clk   (i_clk),
-          .i_rst   (i_rst),
-          .i_set   (acc_set),
-          .i_touch (touch_en),
-          .i_way   (touch_way),
-          .o_victim(policy_way)
-      );
+      // PLRU: plru.v holds the tree for one set, so there is one instance
+      // per set. Only the accessed set's tree is touched each cycle, and the
+      // victim comes from that set's tree. i_valid is tied to all ones
+      // because cache.v already picks the lowest invalid way first.
+      wire [WAY_W-1:0] plru_victim [0:NUM_SETS-1];
+      genvar s;
+      for (s = 0; s < NUM_SETS; s = s + 1) begin : g_set
+        localparam [IDX_W-1:0] SET = s;
+        plru #(
+            .NUM_WAYS(NUM_WAYS)
+        ) u_plru (
+            .i_clk       (i_clk),
+            .i_rst       (i_rst),
+            .i_valid     ({NUM_WAYS{1'b1}}),
+            .i_touch     (touch_en & (acc_set == SET)),
+            .i_touch_way (touch_way),
+            .o_victim_way(plru_victim[s])
+        );
+      end
+      assign policy_way = plru_victim[acc_set];
     end else begin : g_lru
 
 
